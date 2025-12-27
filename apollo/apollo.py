@@ -54,6 +54,12 @@ def update_overshoot(scale: AcaiaScale, mgr: ControlManager):
 
 
 def check_target_disable_relay(scale: AcaiaScale, mgr: ControlManager):
+    # Grace Period: Ignore weight checks for the first 1.5 seconds.
+    # This gives the scale time to process the "Tare" command and return to 0.0g.
+    # Without this, it reads the empty cup weight (e.g. 200g) and stops instantly.
+    if mgr.shot_time_elapsed() < 1.5:
+        return
+    
     if mgr.relay_on() and scale.weight > mgr.current_memory().target_minus_overshoot():
         mgr.disable_relay()
         overshoot_update_executor.submit(update_overshoot, scale, mgr)
