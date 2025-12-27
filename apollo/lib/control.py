@@ -51,30 +51,29 @@ class ControlManager:
         self.relay_off_time = timer()
         self.shot_timer_start: Optional[float] = None
         self.image_needs_save = False
-        self.running = True  # Flag to keep watchdog alive
+        self.running = True
+        
+        # ASYNC SCANNER VARIABLES
+        self.discovered_mac: Optional[str] = None
+        self.scale_is_connected_flag = False # Updated by main loop to pause scanning
+        
         self.load_memory()
 
         self.relay = DigitalOutputDevice(ControlManager.RELAY_GPIO)
 
-        # TARGET BUTTONS
-        self.tgt_inc_button = Button(ControlManager.TGT_INC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.05)
+        # TARGET BUTTONS - Reduced bounce_time for faster response
+        self.tgt_inc_button = Button(ControlManager.TGT_INC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.02)
         self.tgt_inc_button.when_released = lambda: self.__change_target(0.1)
         self.tgt_inc_button.when_held = lambda: self.__change_target_held(1)
 
-        self.tgt_dec_button = Button(ControlManager.TGT_DEC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.05)
+        self.tgt_dec_button = Button(ControlManager.TGT_DEC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.02)
         self.tgt_dec_button.when_released = lambda: self.__change_target(-0.1)
         self.tgt_dec_button.when_held = lambda: self.__change_target_held(-1)
 
-        # PADDLE SWITCH (CRITICAL CHANGES HERE)
-        # 1. bounce_time=None (Raw signal, we handle noise in logic)
+        # PADDLE SWITCH - Watchdog Mode
         self.paddle_switch = Button(ControlManager.PADDLE_GPIO, pull_up=True, bounce_time=None)
-        
-        # 2. Only use Interrupt for STARTING (Pressed)
         self.paddle_switch.when_pressed = self.__start_shot
         
-        # 3. DO NOT use when_released. We use the Watchdog instead.
-        # self.paddle_switch.when_released = self.disable_relay 
-
         self.tare_button = Button(ControlManager.TARE_GPIO, pull_up=True)
 
         self.memory_button = Button(ControlManager.MEM_GPIO, pull_up=True)
@@ -83,30 +82,54 @@ class ControlManager:
         self.scale_connect_button = Button(ControlManager.SCALE_CONNECT_GPIO, pull_up=True)
         self.tgt_button_was_held = False
 
-        # START WATCHDOG
+        # START THREADS
+        # 1. Paddle Safety Watchdog
         self.wd_thread = threading.Thread(target=self._watchdog_loop)
         self.wd_thread.daemon = True
         self.wd_thread.start()
 
+        # 2. Bluetooth Scanner Thread (Prevents UI freezing)
+        self.scan_thread = threading.Thread(target=self._bg_scan_loop)
+        self.scan_thread.daemon = True
+        self.scan_thread.start()
+
     def _watchdog_loop(self):
-        """
-        Safety Loop: Checks 20 times/sec if the paddle is physically open.
-        This guarantees the relay turns off even if the 'Event' is missed.
-        """
+        """Checks 20 times/sec if the paddle is physically open."""
         logging.info("Paddle Watchdog Started")
         while self.running:
-            # If Relay is ON, but Switch is NOT Pressed (Open/3.3V) -> STOP
             if self.relay_on() and not self.paddle_switch.is_pressed:
-                # Double check to filter micro-noise (10ms wait)
-                time.sleep(0.01)
+                time.sleep(0.01) # Filter noise
                 if not self.paddle_switch.is_pressed:
                     logging.info("Watchdog detected paddle OPEN - Stopping shot")
                     self.disable_relay()
-            
-            time.sleep(0.05) # Check every 50ms
+            time.sleep(0.05)
+
+    def _bg_scan_loop(self):
+        """Scans for scale in background so Main Loop never freezes."""
+        logging.info("Bluetooth Background Scanner Started")
+        while self.running:
+            # Only scan if:
+            # 1. Switch is ON
+            # 2. Scale is NOT currently connected
+            # 3. We don't already have a pending discovered MAC
+            if self.should_scale_connect() and not self.scale_is_connected_flag and self.discovered_mac is None:
+                try:
+                    # This blocks for 1s, but it's okay because we are in a background thread!
+                    devices = pyacaia.find_acaia_devices(timeout=1)
+                    if devices:
+                        self.discovered_mac = devices[0]
+                        logging.debug("Background Scanner found: %s" % self.discovered_mac)
+                        time.sleep(1) # Wait a bit before next check
+                    else:
+                        time.sleep(5) # Scan failed, wait 5s to save CPU/Battery
+                except Exception as e:
+                    logging.error("Scanner Error: %s" % e)
+                    time.sleep(5)
+            else:
+                # If connected or switch off, just sleep peacefully
+                time.sleep(1)
 
     def save_memory(self):
-        # We don't call this directly in the loop anymore, but keeping it for manual calls if needed
         self._save_worker(self.memories)
 
     def _save_worker(self, data_to_save):
@@ -141,13 +164,11 @@ class ControlManager:
                 self.flow_rate_data.popleft()
 
     def disable_relay(self):
-        # Only act if relay is actually on (prevents log spam)
         if self.relay_on():
             logging.info("disable relay")
             self.relay_off_time = timer()
             self.relay.off()
-
-            # Thread-safe save
+            
             memories_snapshot = copy.deepcopy(self.memories)
             save_thread = threading.Thread(target=self._save_worker, args=(memories_snapshot,))
             save_thread.start()
@@ -180,42 +201,49 @@ class ControlManager:
         self.memories.rotate(-1)
 
     def __start_shot(self):
-        # SAFETY CHECK: If the relay is already on, ignore this press
         if self.relay_on():
             return
-
         logging.info("Start shot")
         self.flow_rate_data = deque([])
-
         if self.tare_button.when_pressed is not None:
             self.tare_button.when_pressed()
             logging.info("Sent tare to scale")
-        
         self.shot_timer_start = timer()
         self.relay.on()
 
 
 def try_connect_scale(scale: AcaiaScale, mgr: ControlManager) -> bool:
     try:
-        if not scale.connected and mgr.should_scale_connect():
-            scale.device = None
-            devices = pyacaia.find_acaia_devices(timeout=1)
-            if devices:
-                scale.mac = devices[0]
-                logging.debug("calling connect on mac %s" % scale.mac)
-                scale.connect()
-                return True
-            else:
-                logging.debug("no devices found")
-                return False
-        elif scale.connected and not mgr.should_scale_connect():
-            logging.debug("scale connected but should not be")
-            scale.disconnect()
+        # Update the Manager with current state so the Background Thread knows what to do
+        mgr.scale_is_connected_flag = scale.connected
+
+        # 1. Check if switch is OFF
+        if not mgr.should_scale_connect():
+            if scale.connected:
+                logging.debug("Scale connect switch off, disconnecting")
+                scale.disconnect()
             return False
+
+        # 2. If already connected, do nothing
         if scale.connected:
-            logging.debug("Connected to scale %s" % scale.mac)
             return True
+
+        # 3. Check if Background Thread found something!
+        if mgr.discovered_mac:
+            logging.info("Main Thread connecting to found MAC: %s" % mgr.discovered_mac)
+            scale.mac = mgr.discovered_mac
+            scale.connect()
+            # Clear the discovery so we can scan again later if connection drops
+            mgr.discovered_mac = None 
+            return True
+
+        # If we are here, we are disconnected and the background thread is still searching.
+        # We return False instantly so the UI doesn't freeze.
+        return False
+
     except Exception as ex:
         logging.error("Failed to connect to found device:%s" % str(ex))
+        # Clear discovery on error to force re-scan
+        mgr.discovered_mac = None
         return False
     
