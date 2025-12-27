@@ -1,0 +1,5 @@
+based on https://github.com/mlsorensen/apollo - with big thanks and high appreciation !
+
+I should fully rewrite control.py and fix deadlocks in pyacaia.py
+
+
