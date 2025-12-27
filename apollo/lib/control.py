@@ -2,6 +2,8 @@ import math
 import logging
 import pickle
 import time
+import copy
+import threading
 from collections import deque
 from timeit import default_timer as timer
 from typing import Optional, Callable
@@ -49,21 +51,29 @@ class ControlManager:
         self.relay_off_time = timer()
         self.shot_timer_start: Optional[float] = None
         self.image_needs_save = False
+        self.running = True  # Flag to keep watchdog alive
         self.load_memory()
 
         self.relay = DigitalOutputDevice(ControlManager.RELAY_GPIO)
 
-        self.tgt_inc_button = Button(ControlManager.TGT_INC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.1)
+        # TARGET BUTTONS
+        self.tgt_inc_button = Button(ControlManager.TGT_INC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.05)
         self.tgt_inc_button.when_released = lambda: self.__change_target(0.1)
         self.tgt_inc_button.when_held = lambda: self.__change_target_held(1)
 
-        self.tgt_dec_button = Button(ControlManager.TGT_DEC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.1)
+        self.tgt_dec_button = Button(ControlManager.TGT_DEC_GPIO, hold_time=0.5, hold_repeat=True, pull_up=True, bounce_time=0.05)
         self.tgt_dec_button.when_released = lambda: self.__change_target(-0.1)
         self.tgt_dec_button.when_held = lambda: self.__change_target_held(-1)
 
-        self.paddle_switch = Button(ControlManager.PADDLE_GPIO, pull_up=True, bounce_time=0.1)
+        # PADDLE SWITCH (CRITICAL CHANGES HERE)
+        # 1. bounce_time=None (Raw signal, we handle noise in logic)
+        self.paddle_switch = Button(ControlManager.PADDLE_GPIO, pull_up=True, bounce_time=None)
+        
+        # 2. Only use Interrupt for STARTING (Pressed)
         self.paddle_switch.when_pressed = self.__start_shot
-        self.paddle_switch.when_released = self.disable_relay
+        
+        # 3. DO NOT use when_released. We use the Watchdog instead.
+        # self.paddle_switch.when_released = self.disable_relay 
 
         self.tare_button = Button(ControlManager.TARE_GPIO, pull_up=True)
 
@@ -73,10 +83,36 @@ class ControlManager:
         self.scale_connect_button = Button(ControlManager.SCALE_CONNECT_GPIO, pull_up=True)
         self.tgt_button_was_held = False
 
+        # START WATCHDOG
+        self.wd_thread = threading.Thread(target=self._watchdog_loop)
+        self.wd_thread.daemon = True
+        self.wd_thread.start()
+
+    def _watchdog_loop(self):
+        """
+        Safety Loop: Checks 20 times/sec if the paddle is physically open.
+        This guarantees the relay turns off even if the 'Event' is missed.
+        """
+        logging.info("Paddle Watchdog Started")
+        while self.running:
+            # If Relay is ON, but Switch is NOT Pressed (Open/3.3V) -> STOP
+            if self.relay_on() and not self.paddle_switch.is_pressed:
+                # Double check to filter micro-noise (10ms wait)
+                time.sleep(0.01)
+                if not self.paddle_switch.is_pressed:
+                    logging.info("Watchdog detected paddle OPEN - Stopping shot")
+                    self.disable_relay()
+            
+            time.sleep(0.05) # Check every 50ms
+
     def save_memory(self):
+        # We don't call this directly in the loop anymore, but keeping it for manual calls if needed
+        self._save_worker(self.memories)
+
+    def _save_worker(self, data_to_save):
         try:
             with open(memory_save_file, 'wb') as savefile:
-                pickle.dump(self.memories, savefile)
+                pickle.dump(data_to_save, savefile)
                 logging.info("Saved shot data to memory")
         except Exception as e:
             logging.error("Error persisting memory: %s" % e)
@@ -105,11 +141,16 @@ class ControlManager:
                 self.flow_rate_data.popleft()
 
     def disable_relay(self):
-        logging.info("disable relay")
+        # Only act if relay is actually on (prevents log spam)
         if self.relay_on():
+            logging.info("disable relay")
             self.relay_off_time = timer()
             self.relay.off()
-            self.save_memory()
+
+            # Thread-safe save
+            memories_snapshot = copy.deepcopy(self.memories)
+            save_thread = threading.Thread(target=self._save_worker, args=(memories_snapshot,))
+            save_thread.start()
 
     def current_memory(self):
         return self.memories[0]
@@ -128,7 +169,6 @@ class ControlManager:
         else:
             self.tgt_button_was_held = False
 
-    # change target to whole number, but don't jump past the nearest whole number
     def __change_target_held(self, amount):
         self.tgt_button_was_held = True
         if amount > 0:
@@ -140,12 +180,17 @@ class ControlManager:
         self.memories.rotate(-1)
 
     def __start_shot(self):
+        # SAFETY CHECK: If the relay is already on, ignore this press
+        if self.relay_on():
+            return
+
         logging.info("Start shot")
         self.flow_rate_data = deque([])
+
         if self.tare_button.when_pressed is not None:
             self.tare_button.when_pressed()
             logging.info("Sent tare to scale")
-            time.sleep(.5)
+        
         self.shot_timer_start = timer()
         self.relay.on()
 
@@ -159,11 +204,6 @@ def try_connect_scale(scale: AcaiaScale, mgr: ControlManager) -> bool:
                 scale.mac = devices[0]
                 logging.debug("calling connect on mac %s" % scale.mac)
                 scale.connect()
-                # if scale.weight is None:
-                #     logging.error("Connected but no weight, need to reconnect")
-                #     scale.disconnect()
-                #     time.sleep(1)
-                #     return False
                 return True
             else:
                 logging.debug("no devices found")
@@ -178,4 +218,4 @@ def try_connect_scale(scale: AcaiaScale, mgr: ControlManager) -> bool:
     except Exception as ex:
         logging.error("Failed to connect to found device:%s" % str(ex))
         return False
-
+    

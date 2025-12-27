@@ -77,22 +77,28 @@ def main():
 
     last_sample_time: Optional[float] = None
     last_weight: Optional[float] = None
+
     while not stop:
-        if control.try_connect_scale(scale, mgr):
+        # Check connection status
+        is_connected = control.try_connect_scale(scale, mgr)
+
+        if is_connected:
+            # Normal operation: Check if we hit target weight
             check_target_disable_relay(scale, mgr)
+        
+        # --- SAFETY CHECK ---
+        elif mgr.relay_on():
+            # The pump is running, but we lost connection to the scale!
+            logging.warning("LOST SCALE CONNECTION DURING SHOT - EMERGENCY STOP")
+            mgr.disable_relay()
+        # ------------------------
+
         if scale is not None and scale.connected:
             (last_sample_time, last_weight) = update_display(scale, mgr, display, last_sample_time, last_weight)
         else:
             display.display_off()
+            
         time.sleep(refreshRate)
-    if scale.connected:
-        try:
-            scale.disconnect()
-        except Exception as ex:
-            logging.error("Error during shutdown: %s" % str(ex))
-    if display is not None:
-        display.stop()
-    logging.info("Exiting on stop")
 
 
 def update_display(scale: AcaiaScale, mgr: ControlManager, display: Display, last_time: float, last_weight: float) -> (float, float):

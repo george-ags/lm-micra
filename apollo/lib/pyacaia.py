@@ -11,6 +11,7 @@ __version__ = "0.4.0"
 
 import logging
 import time
+import threading
 from threading import Thread, Timer, Lock
 
 root = logging.getLogger()
@@ -748,18 +749,26 @@ class AcaiaScale(object):
         self.timer_running = False
 
     def disconnect(self):
-        self.connected = False
-        if self.device:
+            self.connected = False
+            if self.device:
+                try:
+                    if self.backend == 'pygatt':
+                        self.device.disconnect()
+                        self.adapter.stop()
+                    elif self.backend == 'bluepy':
+                        self.device.disconnect()
+                except Exception as e:
+                    logging.error("Error disconnecting from BT backend: %s" % e)
 
-            if self.backend == 'pygatt':
-                self.device.disconnect()
-                self.adapter.stop()
-
-            elif self.backend == 'bluepy':
-                self.device.disconnect()
-        self.set_interval_thread.stop()
-        self.set_interval_thread.join()
-
+            # FIX: Prevent Deadlock
+            if self.set_interval_thread:
+                self.set_interval_thread.stop()
+                
+                # Check if we are calling this FROM the interval thread itself
+                if threading.current_thread() != self.set_interval_thread:
+                    self.set_interval_thread.join()
+                else:
+                    logging.debug("Skipping thread join (preventing deadlock)")
 
 def main():
     addresses = find_acaia_devices()
